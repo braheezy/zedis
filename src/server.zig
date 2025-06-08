@@ -1,7 +1,14 @@
 const std = @import("std");
+const assert = std.debug.assert;
+
+const root = @import("root.zig");
+const readAll = root.readAll;
+const writeAll = root.writeAll;
+const max_msg_size = root.max_msg_size;
 
 pub fn main() !void {
     const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(fd);
 
     try std.posix.setsockopt(
         fd,
@@ -26,20 +33,38 @@ pub fn main() !void {
 
     std.log.info("server is running on port 1234", .{});
     while (true) {
+        // accept
         var client_addr: std.posix.sockaddr = undefined;
         var client_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
         const client_fd = try std.posix.accept(fd, &client_addr, &client_addr_len, 0);
+        defer std.posix.close(client_fd);
 
-        try doSomething(client_fd);
+        // only serves one client connection at once
+        while (true) {
+            oneRequest(client_fd) catch break;
+        }
     }
 }
 
-fn doSomething(conn_fd: std.posix.socket_t) !void {
-    var buf: [1024]u8 = undefined;
-    const bytes_read = try std.posix.read(conn_fd, &buf);
+fn oneRequest(conn_fd: std.posix.socket_t) !void {
+    // 4 bytes header
+    var buf: [4 + max_msg_size]u8 = undefined;
+    try readAll(conn_fd, buf[0..4]);
 
-    std.debug.print("client says: {s}\n", .{buf[0..bytes_read]});
+    const msg_len = std.mem.readInt(u32, buf[0..4], .little);
+    if (msg_len > max_msg_size) {
+        return error.MessageTooLong;
+    }
 
-    const wbuf = "world";
-    _ = try std.posix.write(conn_fd, wbuf);
+    // request body
+    try readAll(conn_fd, buf[4 .. msg_len + 4]);
+
+    std.debug.print("client says: {s}\n", .{buf[4 .. msg_len + 4]});
+    // reply using the same protocol
+    const reply = "world";
+    var reply_buf: [4 + reply.len]u8 = undefined;
+    @memcpy(reply_buf[0..4], &std.mem.toBytes(@as(u32, @intCast(reply.len))));
+    @memcpy(reply_buf[4 .. reply.len + 4], reply);
+
+    try writeAll(conn_fd, &reply_buf);
 }

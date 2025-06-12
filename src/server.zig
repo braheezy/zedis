@@ -53,9 +53,9 @@ pub fn main() !void {
     try std.posix.listen(fd, std.os.linux.SOMAXCONN);
 
     // a map of all client connections, keyed by fd
-    var conns = try allocator.alloc(?Conn, 1024);
+    var conns = std.ArrayList(?Conn).init(allocator);
     @memset(conns, null);
-    defer allocator.free(conns);
+    defer conns.deinit();
 
     // the event loop
     var poll_args = std.ArrayList(std.os.linux.pollfd).init(allocator);
@@ -69,20 +69,24 @@ pub fn main() !void {
         poll_args.append(.{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 });
 
         // the rest are connection sockets
-        for (conns) |conn| {
-            const pfd = std.os.linux.pollfd{
-                .fd = conn.fd,
-                .events = std.os.linux.POLL.ERR,
-                .revents = 0,
-            };
-            // poll() flags from the application's intent
-            if (conn.want_read) {
-                pfd.events |= std.os.linux.POLL.IN;
+        for (conns.items) |maybe_conn| {
+            if (maybe_conn) |conn| {
+                const pfd = std.os.linux.pollfd{
+                    .fd = conn.fd,
+                    .events = std.os.linux.POLL.ERR,
+                    .revents = 0,
+                };
+                // poll() flags from the application's intent
+                if (conn.want_read) {
+                    pfd.events |= std.os.linux.POLL.IN;
+                }
+                if (conn.want_write) {
+                    pfd.events |= std.os.linux.POLL.OUT;
+                }
+                poll_args.append(pfd);
+            } else {
+                continue;
             }
-            if (conn.want_write) {
-                pfd.events |= std.os.linux.POLL.OUT;
-            }
-            poll_args.append(pfd);
         }
 
         // wait for readiness
@@ -90,8 +94,8 @@ pub fn main() !void {
 
         // handle the listening socket
         if (poll_args.items[0].revents != 0) {
-            if (handleAccept(fd)) |conn| {
-                try conns.append(conn);
+            if (try handleAccept(fd)) |conn| {
+                conns.items[conn.fd] = conn;
             }
         }
 
@@ -99,7 +103,8 @@ pub fn main() !void {
         var i: usize = 1;
         while (i < poll_args.items.len) {
             const ready = poll_args.items[i].revents;
-            const conn = conns.items[poll_args.items[i].fd];
+            const conn = conns.items[poll_args.items[i].fd] orelse unreachable;
+
             if (ready & std.os.linux.POLL.IN != 0) {
                 // application logic
                 try handleRead(conn);
@@ -112,6 +117,7 @@ pub fn main() !void {
             // close the socket from socket error or application logic
             if (ready & std.os.linux.POLL.ERR != 0 or conn.want_close) {
                 std.posix.close(conn.fd);
+                conns.items[conn.fd] = null;
             }
         }
     }
@@ -138,4 +144,33 @@ fn oneRequest(conn_fd: std.posix.socket_t) !void {
     @memcpy(reply_buf[4 .. reply.len + 4], reply);
 
     try writeAll(conn_fd, &reply_buf);
+}
+
+fn fcntlSetNonBlocking(fd: std.posix.socket_t) !void {
+    const F = std.posix.F;
+    try std.posix.fcntl(
+        fd,
+        try std.posix.fcntl(fd, F.GETFL, 0) | std.os.linux.SOCK.NONBLOCK,
+        0,
+    );
+}
+
+fn handleAccept(fd: std.posix.socket_t) !?Conn {
+    // accept
+    var client_addr: std.posix.sockaddr = undefined;
+    var client_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    const client_fd = std.posix.accept(
+        fd,
+        @as(*std.posix.sockaddr, @ptrCast(&client_addr)),
+        &client_addr_len,
+        0,
+    ) catch return null;
+
+    // set the new connection fd to nonblocking mode
+    fcntlSetNonBlocking(client_fd) catch return null;
+
+    return Conn{
+        .fd = client_fd,
+        .want_read = true,
+    };
 }

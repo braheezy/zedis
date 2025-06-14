@@ -138,10 +138,9 @@ pub fn main() !void {
     }
 }
 
-const O_NONBLOCK = @as(i32, 0x0004); // This is the value for O_NONBLOCK on macOS
 fn fcntlSetNonBlocking(fd: std.posix.socket_t) !void {
     const F = std.posix.F;
-    const cmd = try std.posix.fcntl(fd, F.GETFL, 0) | O_NONBLOCK;
+    const cmd = try std.posix.fcntl(fd, F.GETFL, 0) | std.posix.LOCK.NB;
     _ = try std.posix.fcntl(
         fd,
         @intCast(cmd),
@@ -186,7 +185,7 @@ fn handleRead(conn: *Conn) !void {
     };
     // handle EOF
     if (n == 0) {
-        if (conn.incoming.items.len == 0) {
+        if (conn.incoming.len() == 0) {
             std.log.debug("client closed", .{});
         } else {
             std.log.debug("unexpected EOF", .{});
@@ -196,12 +195,12 @@ fn handleRead(conn: *Conn) !void {
     }
 
     // 2. Add new data to the incoming buffer
-    try conn.incoming.appendSlice(buf[0..n]);
+    try conn.incoming.append(buf[0..n]);
 
     while (try conn.oneRequest()) {}
 
     // update the readiness intention
-    if (conn.outgoing.items.len > 0) { // has a response
+    if (conn.outgoing.len() > 0) { // has a response
         conn.want_read = false;
         conn.want_write = true;
         return handleWrite(conn);
@@ -209,16 +208,20 @@ fn handleRead(conn: *Conn) !void {
 }
 
 fn handleWrite(conn: *Conn) !void {
-    assert(conn.outgoing.items.len > 0);
-    const n = std.posix.write(conn.fd, conn.outgoing.items) catch {
+    assert(conn.outgoing.len() > 0);
+    const n = std.posix.write(conn.fd, conn.outgoing.slice()) catch |err| {
+        if (err == error.WouldBlock) {
+            // actually not ready
+            return;
+        }
         conn.want_close = true;
         return;
     };
     // remove written data from `outgoing`
-    conn.outgoing.replaceRangeAssumeCapacity(0, n, &.{});
+    conn.outgoing.consume(n);
 
     // update the readiness intention
-    if (conn.outgoing.items.len == 0) { // all data written
+    if (conn.outgoing.len() == 0) { // all data written
         conn.want_read = true;
         conn.want_write = false;
     } // else: want write

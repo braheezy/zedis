@@ -24,8 +24,47 @@ pub fn main() !void {
         @sizeOf(std.posix.sockaddr.in),
     );
 
-    try query(fd, "hello1");
-    try query(fd, "hello2");
+    const query_list = [_][]const u8{
+        "hello1",
+        "hello2",
+        "hello3",
+        "z" ** max_msg_size,
+    };
+
+    for (query_list) |q| {
+        try sendRequest(fd, q);
+    }
+    for (query_list) |_| {
+        try readResponse(fd);
+    }
+}
+
+fn sendRequest(fd: std.posix.socket_t, msg: []const u8) !void {
+    if (msg.len > max_msg_size) {
+        return error.MessageTooLong;
+    }
+
+    // send request
+    var write_buf: [4 + max_msg_size]u8 = undefined;
+    @memcpy(write_buf[0..4], &std.mem.toBytes(@as(u32, @intCast(msg.len))));
+    @memcpy(write_buf[4 .. msg.len + 4], msg);
+    try writeAll(fd, write_buf[0 .. msg.len + 4]);
+}
+
+fn readResponse(fd: std.posix.socket_t) !void {
+    // 4 bytes header
+    var read_buf: [4 + max_msg_size + 1]u8 = undefined;
+    try readAll(fd, read_buf[0..4]);
+
+    const msg_len = std.mem.readInt(u32, read_buf[0..4], .little);
+    if (msg_len > max_msg_size) {
+        return error.MessageTooLong;
+    }
+
+    // reply body
+    try readAll(fd, read_buf[4 .. msg_len + 4]);
+    const len = @min(100, msg_len + 4);
+    std.debug.print("len:{d} data:{s}\n", .{ len, read_buf[4..len] });
 }
 
 fn query(fd: std.posix.socket_t, msg: []const u8) !void {

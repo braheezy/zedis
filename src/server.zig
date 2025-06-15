@@ -6,12 +6,26 @@ const root = @import("root.zig");
 const readAll = root.readAll;
 const writeAll = root.writeAll;
 const max_msg_size = root.max_msg_size;
+const max_args = 200 * 1000;
 const Conn = @import("Conn.zig").Conn;
+const Buffer = @import("Buffer.zig");
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
-pub fn main() !void {
+const Status = enum(u32) {
+    ok,
+    err,
+    nx,
+};
 
+const Response = struct {
+    status: Status = .ok,
+    data: []const u8 = undefined,
+};
+
+var g_data: std.StringHashMap([]const u8) = undefined;
+
+pub fn main() !void {
     // Memory allocation setup
     const allocator, const is_debug = gpa: {
         if (builtin.os.tag == .wasi) break :gpa .{ std.heap.wasm_allocator, false };
@@ -27,6 +41,8 @@ pub fn main() !void {
             }
         }
     }
+
+    g_data = std.StringHashMap([]const u8).init(allocator);
 
     const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     defer std.posix.close(fd);
@@ -119,7 +135,7 @@ pub fn main() !void {
             if (ready & std.os.linux.POLL.IN != 0) {
                 // application logic
                 assert(conn.want_read);
-                try handleRead(conn);
+                try handleRead(allocator, conn);
             }
             if (ready & std.os.linux.POLL.OUT != 0) {
                 // application logic
@@ -176,7 +192,7 @@ fn handleAccept(allocator: std.mem.Allocator, fd: std.posix.socket_t) !?*Conn {
     return conn;
 }
 
-fn handleRead(conn: *Conn) !void {
+fn handleRead(allocator: std.mem.Allocator, conn: *Conn) !void {
     // 1. Do a non-blocking read.
     var buf: [64 * 1024]u8 = undefined;
     const n = std.posix.read(conn.fd, &buf) catch {
@@ -197,7 +213,7 @@ fn handleRead(conn: *Conn) !void {
     // 2. Add new data to the incoming buffer
     try conn.incoming.append(buf[0..n]);
 
-    while (try conn.oneRequest()) {}
+    while (try oneRequest(allocator, conn)) {}
 
     // update the readiness intention
     if (conn.outgoing.len() > 0) { // has a response
@@ -225,4 +241,107 @@ fn handleWrite(conn: *Conn) !void {
         conn.want_read = true;
         conn.want_write = false;
     } // else: want write
+}
+
+// process 1 request if there is enough data
+fn oneRequest(allocator: std.mem.Allocator, conn: *Conn) !bool {
+    // Protocol: message header
+    if (conn.incoming.len() < 4) {
+        // want read
+        return false;
+    }
+
+    const incoming_slice = conn.incoming.slice();
+    const msg_len = std.mem.bytesToValue(u32, incoming_slice[0..4]);
+    if (msg_len > max_msg_size) {
+        // protocol error
+        conn.want_close = true;
+        return error.MessageTooLong;
+    }
+
+    // Protocol: message body
+    if (4 + msg_len > incoming_slice.len) {
+        // want read
+        return false;
+    }
+
+    // request body
+    const request = incoming_slice[4 .. 4 + msg_len];
+
+    std.log.info("client says: len: {d}, data: {s}", .{ request.len, request[0..@min(request.len, 100)] });
+
+    // Process the parsed message.
+    const cmd = parseRequest(allocator, request) catch {
+        conn.want_close = true;
+        return false;
+    };
+    const response = try doRequest(allocator, cmd);
+    try makeResponse(response, &conn.outgoing);
+
+    // Remove the message from incoming
+    conn.incoming.consume(msg_len + 4);
+
+    return true;
+}
+
+fn parseRequest(allocator: std.mem.Allocator, request: []const u8) ![]const []const u8 {
+    var pos: usize = 0;
+    const nstr = try readU32(request, &pos);
+    if (nstr > max_args) return error.TooManyArgs;
+
+    var out = std.ArrayList([]const u8).init(allocator);
+    // defer out.deinit();
+
+    while (out.items.len < nstr) {
+        const len = try readU32(request, &pos);
+        const s = try readSlice(request, &pos, len);
+        try out.append(s);
+    }
+
+    if (pos != request.len) return error.TrailingGarbage;
+    return out.toOwnedSlice();
+}
+
+fn readU32(data: []const u8, pos: *usize) !u32 {
+    if (pos.* + 4 > data.len) return error.Truncated;
+    const v = std.mem.bytesToValue(u32, data[pos.* .. pos.* + 4]);
+    pos.* += 4;
+    return v;
+}
+fn readSlice(data: []const u8, pos: *usize, len: u32) ![]const u8 {
+    const count: usize = @intCast(len);
+    if (pos.* + count > data.len) return error.Truncated;
+    const slice = data[pos.* .. pos.* + count];
+    pos.* += count;
+    return slice;
+}
+
+fn doRequest(allocator: std.mem.Allocator, cmd: []const []const u8) !Response {
+    var out = Response{};
+    if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "get")) {
+        if (g_data.get(cmd[1])) |valPtr| {
+            out.data = valPtr;
+            out.status = .ok;
+        } else {
+            out.status = .nx;
+        }
+    } else if (cmd.len == 3 and std.mem.eql(u8, cmd[0], "set")) {
+        const key = try allocator.dupe(u8, cmd[1]);
+        const value = try allocator.dupe(u8, cmd[2]);
+        try g_data.put(key, value);
+    } else if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "del")) {
+        _ = g_data.remove(cmd[1]);
+    } else {
+        // unknown command
+        out.status = .err;
+    }
+
+    return out;
+}
+
+fn makeResponse(response: Response, outgoing: *Buffer) !void {
+    const response_len: u32 = @intCast(4 + response.data.len);
+    try outgoing.append(&std.mem.toBytes(response_len));
+    try outgoing.append(&std.mem.toBytes(response.status));
+    try outgoing.append(response.data);
 }

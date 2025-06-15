@@ -17,7 +17,6 @@ incoming: Buffer,
 outgoing: Buffer,
 
 pub fn init(allocator: std.mem.Allocator, fd: std.posix.socket_t) !*Conn {
-    std.debug.print("init conn w/ fd: {d}\n", .{fd});
     const conn = try allocator.create(Conn);
     conn.* = Conn{
         .fd = fd,
@@ -31,42 +30,4 @@ pub fn deinit(self: *Conn, allocator: std.mem.Allocator) void {
     self.incoming.deinit();
     self.outgoing.deinit();
     allocator.destroy(self);
-}
-
-// process 1 request if there is enough data
-pub fn oneRequest(self: *Conn) !bool {
-    // Protocol: message header
-    if (self.incoming.len() < 4) {
-        // want read
-        return false;
-    }
-
-    const incoming_slice = self.incoming.slice();
-    const msg_len = std.mem.readInt(u32, incoming_slice[0..4], .little);
-    if (msg_len > max_msg_size) {
-        // protocol error
-        self.want_close = true;
-        return error.MessageTooLong;
-    }
-
-    // Protocol: message body
-    if (4 + msg_len > incoming_slice.len) {
-        // want read
-        return false;
-    }
-
-    // request body
-    const request = incoming_slice[4 .. 4 + msg_len];
-
-    std.log.info("client says: len: {d}, data: {s}", .{ request.len, request[0..@min(request.len, 100)] });
-
-    // Process the parsed message.
-    // generate the response (echo)
-    try self.outgoing.append(&std.mem.toBytes(msg_len));
-    try self.outgoing.append(request);
-
-    // Remove the message from incoming
-    self.incoming.consume(msg_len + 4);
-
-    return true;
 }

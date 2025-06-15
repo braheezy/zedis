@@ -7,7 +7,7 @@ const rehashing_work = 128;
 
 pub const Node = struct {
     next: ?*Node = null,
-    code: u64,
+    code: u64 = 0,
 };
 
 pub const Table = struct {
@@ -29,7 +29,7 @@ pub const Table = struct {
         if (self.slots) |slots| std.heap.page_allocator.free(slots);
     }
 
-    fn insert(self: *Table, node: *Node) !void {
+    fn insert(self: *Table, node: *Node) void {
         const pos = node.code & self.mask;
         const next = self.slots.?[pos];
         node.next = next;
@@ -37,12 +37,12 @@ pub const Table = struct {
         self.size += 1;
     }
 
-    fn lookup(self: *Table, key: *Node, eq: LookupFn) ?*Node {
+    fn lookup(self: *Table, key: *Node, eq: LookupFn) ?*?*Node {
         if (self.slots == null) return null;
 
         const pos = key.code & self.mask;
         // incoming pointer to the target
-        const from = &self.slots.?[pos];
+        var from = &self.slots.?[pos];
 
         while (true) {
             // load the current entry
@@ -60,10 +60,9 @@ pub const Table = struct {
         }
         return null;
     }
-
-    fn detach(self: *Table, from: **Node) *Node {
+    fn detach(self: *Table, from: *?*Node) *Node {
         // the target node
-        const node = from.*;
+        const node = from.*.?;
         // update the incoming pointer to the target
         from.* = node.next;
         self.size -= 1;
@@ -72,31 +71,31 @@ pub const Table = struct {
 };
 
 pub const Map = struct {
-    newer: Table,
-    older: Table,
+    newer: Table = .{},
+    older: Table = .{},
     migrate_pos: usize = 0,
 
     pub fn lookup(self: *Map, key: *Node, eq: LookupFn) ?*Node {
         // migrate some keys
         self.helpRehashing();
 
-        const from = self.newer.lookup(key, eq);
+        var from = self.newer.lookup(key, eq);
         if (from == null) {
             from = self.older.lookup(key, eq);
         }
 
-        return from;
+        return if (from) |f| f.* else null;
     }
 
     pub fn delete(self: *Map, key: *Node, eq: LookupFn) ?*Node {
         // migrate some keys
         self.helpRehashing();
 
-        if (self.newer.lookup(key, eq)) |node| {
-            return self.newer.detach(&node);
+        if (self.newer.lookup(key, eq)) |from| {
+            return self.newer.detach(from);
         }
-        if (self.older.lookup(key, eq)) |node| {
-            return self.older.detach(&node);
+        if (self.older.lookup(key, eq)) |from| {
+            return self.older.detach(from);
         }
         return null;
     }
@@ -141,7 +140,7 @@ pub const Map = struct {
         // discard the old table if done
         if (self.older.size == 0 and self.older.slots != null) {
             self.older.deinit();
-            self.older.slots = .{};
+            self.older.slots = null;
         }
     }
 };

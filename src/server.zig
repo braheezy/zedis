@@ -9,21 +9,9 @@ const max_msg_size = root.max_msg_size;
 const max_args = 200 * 1000;
 const Conn = @import("Conn.zig").Conn;
 const Buffer = @import("Buffer.zig");
+const hash = @import("hash.zig");
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-
-const Status = enum(u32) {
-    ok,
-    err,
-    nx,
-};
-
-const Response = struct {
-    status: Status = .ok,
-    data: []const u8 = undefined,
-};
-
-var g_data: std.StringHashMap([]const u8) = undefined;
 
 pub fn main() !void {
     // Memory allocation setup
@@ -42,7 +30,7 @@ pub fn main() !void {
         }
     }
 
-    g_data = std.StringHashMap([]const u8).init(allocator);
+    g_data = .{};
 
     const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     defer std.posix.close(fd);
@@ -152,6 +140,43 @@ pub fn main() !void {
             }
         }
     }
+}
+
+const Status = enum(u32) {
+    ok,
+    err,
+    nx,
+};
+
+const Response = struct {
+    status: Status = .ok,
+    data: []const u8 = undefined,
+};
+
+const GlobalData = struct {
+    db: hash.Map = .{},
+};
+
+var g_data: GlobalData = undefined;
+
+const Entry = struct {
+    node: hash.Node = .{},
+    key: []const u8 = undefined,
+    value: []const u8 = undefined,
+};
+
+fn entryEq(a: *hash.Node, b: *hash.Node) bool {
+    const left: *Entry = @fieldParentPtr("node", a);
+    const right: *Entry = @fieldParentPtr("node", b);
+    return std.mem.eql(u8, left.key, right.key);
+}
+
+fn stringHash(data: []const u8) u64 {
+    var h: u64 = 0x811C9DC5;
+    for (data) |c| {
+        h = (h + c) *% 0x01000193;
+    }
+    return h;
 }
 
 fn fcntlSetNonBlocking(fd: std.posix.socket_t) !void {
@@ -317,26 +342,16 @@ fn readSlice(data: []const u8, pos: *usize, len: u32) ![]const u8 {
 }
 
 fn doRequest(allocator: std.mem.Allocator, cmd: []const []const u8) !Response {
-    var out = Response{};
     if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "get")) {
-        if (g_data.get(cmd[1])) |valPtr| {
-            out.data = valPtr;
-            out.status = .ok;
-        } else {
-            out.status = .nx;
-        }
+        return get(cmd);
     } else if (cmd.len == 3 and std.mem.eql(u8, cmd[0], "set")) {
-        const key = try allocator.dupe(u8, cmd[1]);
-        const value = try allocator.dupe(u8, cmd[2]);
-        try g_data.put(key, value);
+        return set(allocator, cmd);
     } else if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "del")) {
-        _ = g_data.remove(cmd[1]);
+        return del(allocator, cmd);
     } else {
         // unknown command
-        out.status = .err;
+        return .{ .status = .err };
     }
-
-    return out;
 }
 
 fn makeResponse(response: Response, outgoing: *Buffer) !void {
@@ -344,4 +359,65 @@ fn makeResponse(response: Response, outgoing: *Buffer) !void {
     try outgoing.append(&std.mem.toBytes(response_len));
     try outgoing.append(&std.mem.toBytes(response.status));
     try outgoing.append(response.data);
+}
+
+fn get(cmd: []const []const u8) Response {
+    var out = Response{};
+    // a dummy `Entry` just for the lookup
+    var dummy_entry = Entry{};
+    dummy_entry.key = cmd[1];
+    dummy_entry.node.code = stringHash(cmd[1]);
+
+    if (g_data.db.lookup(&dummy_entry.node, entryEq)) |node| {
+        const entry: *Entry = @fieldParentPtr("node", node);
+        const value = entry.value;
+        assert(value.len < max_msg_size);
+        out.data = value;
+    } else {
+        out.status = .nx;
+    }
+
+    return out;
+}
+
+fn set(allocator: std.mem.Allocator, cmd: []const []const u8) !Response {
+    // a dummy `Entry` just for the lookup
+    var dummy_entry = Entry{};
+    dummy_entry.key = cmd[1];
+    dummy_entry.node.code = stringHash(cmd[1]);
+
+    if (g_data.db.lookup(&dummy_entry.node, entryEq)) |node| {
+        // found, update the value
+        const entry: *Entry = @fieldParentPtr("node", node);
+        // Free old value and duplicate new one
+        allocator.free(entry.value);
+        entry.value = try allocator.dupe(u8, cmd[2]);
+    } else {
+        // not found, allocate & insert a new pair
+        const entry = try allocator.create(Entry);
+        entry.* = .{
+            .key = try allocator.dupe(u8, cmd[1]),
+            .node = .{
+                .code = dummy_entry.node.code,
+            },
+            .value = try allocator.dupe(u8, cmd[2]),
+        };
+        try g_data.db.insert(&entry.node);
+    }
+    return .{};
+}
+
+fn del(allocator: std.mem.Allocator, cmd: []const []const u8) Response {
+    // a dummy `Entry` just for the lookup
+    var dummy_entry = Entry{};
+    dummy_entry.key = cmd[1];
+    dummy_entry.node.code = stringHash(cmd[1]);
+    if (g_data.db.delete(&dummy_entry.node, entryEq)) |node| {
+        const entry: *Entry = @fieldParentPtr("node", node);
+        // free the strings and entry
+        allocator.free(entry.key);
+        allocator.free(entry.value);
+        allocator.destroy(entry);
+    }
+    return .{};
 }

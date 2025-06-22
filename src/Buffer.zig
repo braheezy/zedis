@@ -63,6 +63,19 @@ pub fn append(self: *Buffer, bytes: []const u8) !void {
     self.data_end += bytes.len;
 }
 
+pub fn appendU8(self: *Buffer, value: u8) !void {
+    return self.append(&[_]u8{value});
+}
+
+pub fn appendU32(self: *Buffer, value: u32) !void {
+    // assume little-endian
+    return self.append(std.mem.asBytes(&value));
+}
+
+pub fn appendI64(self: *Buffer, value: i64) !void {
+    return self.append(std.mem.asBytes(&value));
+}
+
 pub fn prepend(self: *Buffer, bytes: []const u8) !void {
     if (self.needsGrow(bytes.len, false)) try self.grow(bytes.len);
     self.data_begin -= bytes.len;

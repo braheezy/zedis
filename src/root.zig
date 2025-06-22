@@ -17,3 +17,17 @@ pub fn writeAll(fd: std.posix.socket_t, buf: []const u8) !void {
         index += try std.posix.write(fd, buf[index..]);
     }
 }
+
+pub const DataType = enum {
+    nil,
+    err,
+    string,
+    int,
+    float,
+    array,
+};
+
+pub const ErrorCode = enum {
+    unknown,
+    too_big,
+};

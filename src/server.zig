@@ -10,6 +10,8 @@ const max_args = 200 * 1000;
 const Conn = @import("Conn.zig").Conn;
 const Buffer = @import("Buffer.zig");
 const hash = @import("hash.zig");
+const DataType = root.DataType;
+const ErrorCode = root.ErrorCode;
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -300,13 +302,40 @@ fn oneRequest(allocator: std.mem.Allocator, conn: *Conn) !bool {
         conn.want_close = true;
         return false;
     };
-    const response = try doRequest(allocator, cmd);
-    try makeResponse(response, &conn.outgoing);
+
+    const header_pos = try responseBegin(&conn.outgoing);
+    try doRequest(allocator, cmd);
+    try responseEnd(&conn.outgoing, header_pos);
+    // try makeResponse(response, &conn.outgoing);
 
     // Remove the message from incoming
     conn.incoming.consume(msg_len + 4);
 
     return true;
+}
+
+fn responseBegin(out: *Buffer) !usize {
+    const pos = out.len();
+    try out.appendU32(0);
+    return pos;
+}
+
+fn responseEnd(out: *Buffer, pos: usize) !void {
+    const msg_size = out.len() - pos - 4;
+    if (msg_size > max_msg_size) {
+        // Truncate the buffer to just the header
+        const to_remove = out.len() - (pos + 4);
+        out.consume(to_remove);
+        // Write the error response
+        try emitErr(out, @intFromEnum(ErrorCode.too_big), "response is too big");
+        const new_size = out.len() - pos - 4;
+        const size_bytes = std.mem.toBytes(@as(u32, @intCast(new_size)));
+        @memcpy(out.slice()[pos .. pos + 4], &size_bytes);
+        return;
+    }
+
+    const size_bytes = std.mem.toBytes(@as(u32, @intCast(msg_size)));
+    @memcpy(out.slice()[pos .. pos + 4], &size_bytes);
 }
 
 fn parseRequest(allocator: std.mem.Allocator, request: []const u8) ![]const []const u8 {
@@ -333,6 +362,7 @@ fn readU32(data: []const u8, pos: *usize) !u32 {
     pos.* += 4;
     return v;
 }
+
 fn readSlice(data: []const u8, pos: *usize, len: u32) ![]const u8 {
     const count: usize = @intCast(len);
     if (pos.* + count > data.len) return error.Truncated;
@@ -341,16 +371,23 @@ fn readSlice(data: []const u8, pos: *usize, len: u32) ![]const u8 {
     return slice;
 }
 
-fn doRequest(allocator: std.mem.Allocator, cmd: []const []const u8) !Response {
+fn doRequest(allocator: std.mem.Allocator, cmd: []const []const u8) !void {
+    var out: Buffer = try Buffer.init(allocator);
+    defer out.deinit();
+
     if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "get")) {
-        return get(cmd);
+        return get(cmd, &out);
     } else if (cmd.len == 3 and std.mem.eql(u8, cmd[0], "set")) {
-        return set(allocator, cmd);
+        return set(allocator, cmd, &out);
     } else if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "del")) {
-        return del(allocator, cmd);
+        return del(allocator, cmd, &out);
     } else {
         // unknown command
-        return .{ .status = .err };
+        return try emitErr(
+            &out,
+            @intFromEnum(ErrorCode.unknown),
+            "unknown command",
+        );
     }
 }
 
@@ -361,8 +398,7 @@ fn makeResponse(response: Response, outgoing: *Buffer) !void {
     try outgoing.append(response.data);
 }
 
-fn get(cmd: []const []const u8) Response {
-    var out = Response{};
+fn get(cmd: []const []const u8, out: *Buffer) !void {
     // a dummy `Entry` just for the lookup
     var dummy_entry = Entry{};
     dummy_entry.key = cmd[1];
@@ -372,15 +408,13 @@ fn get(cmd: []const []const u8) Response {
         const entry: *Entry = @fieldParentPtr("node", node);
         const value = entry.value;
         assert(value.len < max_msg_size);
-        out.data = value;
+        return emitString(out, value);
     } else {
-        out.status = .nx;
+        return emitNil(out);
     }
-
-    return out;
 }
 
-fn set(allocator: std.mem.Allocator, cmd: []const []const u8) !Response {
+fn set(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !void {
     // a dummy `Entry` just for the lookup
     var dummy_entry = Entry{};
     dummy_entry.key = cmd[1];
@@ -404,10 +438,10 @@ fn set(allocator: std.mem.Allocator, cmd: []const []const u8) !Response {
         };
         try g_data.db.insert(&entry.node);
     }
-    return .{};
+    return emitNil(out);
 }
 
-fn del(allocator: std.mem.Allocator, cmd: []const []const u8) Response {
+fn del(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !void {
     // a dummy `Entry` just for the lookup
     var dummy_entry = Entry{};
     dummy_entry.key = cmd[1];
@@ -418,6 +452,36 @@ fn del(allocator: std.mem.Allocator, cmd: []const []const u8) Response {
         allocator.free(entry.key);
         allocator.free(entry.value);
         allocator.destroy(entry);
+        return emitInt(out, 1);
     }
-    return .{};
+    return emitInt(out, 0);
+}
+
+// fn keys(){}
+
+fn emitNil(out: *Buffer) !void {
+    try out.appendU8(@intFromEnum(DataType.nil));
+}
+
+fn emitString(out: *Buffer, value: []const u8) !void {
+    try out.appendU8(@intFromEnum(DataType.string));
+    try out.appendU32(@intCast(value.len));
+    try out.append(value);
+}
+
+fn emitInt(out: *Buffer, value: i64) !void {
+    try out.appendU8(@intFromEnum(DataType.int));
+    try out.appendI64(value);
+}
+
+fn emitArray(out: *Buffer, n: u32) !void {
+    try out.appendU8(@intFromEnum(DataType.array));
+    try out.appendU32(n);
+}
+
+fn emitErr(out: *Buffer, code: u32, msg: []const u8) !void {
+    try out.appendU8(@intFromEnum(DataType.err));
+    try out.appendU32(code);
+    try out.appendU32(@intCast(msg.len));
+    try out.append(msg);
 }

@@ -72,6 +72,10 @@ pub fn appendU32(self: *Buffer, value: u32) !void {
     return self.append(std.mem.asBytes(&value));
 }
 
+pub fn appendF64(self: *Buffer, value: f64) !void {
+    return self.append(std.mem.asBytes(&value));
+}
+
 pub fn appendI64(self: *Buffer, value: i64) !void {
     return self.append(std.mem.asBytes(&value));
 }

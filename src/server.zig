@@ -173,6 +173,21 @@ fn entryEq(a: *hash.Node, b: *hash.Node) bool {
     return std.mem.eql(u8, left.key, right.key);
 }
 
+fn keysCb(node: *hash.Node, arg: ?*anyopaque) bool {
+    const entry: *Entry = @fieldParentPtr("node", node);
+    const out: *Buffer = @ptrCast(@alignCast(arg.?));
+    emitString(out, entry.key) catch return false;
+    return true;
+}
+
+fn keys(out: *Buffer) !void {
+    // First emit array header with total number of entries
+    try emitArray(out, @intCast(g_data.db.newer.size + if (g_data.db.older.slots != null) g_data.db.older.size else 0));
+
+    // Iterate over all entries
+    _ = g_data.db.forEach(keysCb, out);
+}
+
 fn stringHash(data: []const u8) u64 {
     var h: u64 = 0x811C9DC5;
     for (data) |c| {
@@ -304,9 +319,8 @@ fn oneRequest(allocator: std.mem.Allocator, conn: *Conn) !bool {
     };
 
     const header_pos = try responseBegin(&conn.outgoing);
-    try doRequest(allocator, cmd);
+    try doRequest(allocator, cmd, &conn.outgoing);
     try responseEnd(&conn.outgoing, header_pos);
-    // try makeResponse(response, &conn.outgoing);
 
     // Remove the message from incoming
     conn.incoming.consume(msg_len + 4);
@@ -344,7 +358,6 @@ fn parseRequest(allocator: std.mem.Allocator, request: []const u8) ![]const []co
     if (nstr > max_args) return error.TooManyArgs;
 
     var out = std.ArrayList([]const u8).init(allocator);
-    // defer out.deinit();
 
     while (out.items.len < nstr) {
         const len = try readU32(request, &pos);
@@ -371,20 +384,19 @@ fn readSlice(data: []const u8, pos: *usize, len: u32) ![]const u8 {
     return slice;
 }
 
-fn doRequest(allocator: std.mem.Allocator, cmd: []const []const u8) !void {
-    var out: Buffer = try Buffer.init(allocator);
-    defer out.deinit();
-
+fn doRequest(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !void {
     if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "get")) {
-        return get(cmd, &out);
+        return get(cmd, out);
     } else if (cmd.len == 3 and std.mem.eql(u8, cmd[0], "set")) {
-        return set(allocator, cmd, &out);
+        return set(allocator, cmd, out);
     } else if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "del")) {
-        return del(allocator, cmd, &out);
+        return del(allocator, cmd, out);
+    } else if (cmd.len == 1 and std.mem.eql(u8, cmd[0], "keys")) {
+        return keys(out);
     } else {
         // unknown command
         return try emitErr(
-            &out,
+            out,
             @intFromEnum(ErrorCode.unknown),
             "unknown command",
         );
@@ -457,8 +469,6 @@ fn del(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !voi
     return emitInt(out, 0);
 }
 
-// fn keys(){}
-
 fn emitNil(out: *Buffer) !void {
     try out.appendU8(@intFromEnum(DataType.nil));
 }
@@ -477,6 +487,11 @@ fn emitInt(out: *Buffer, value: i64) !void {
 fn emitArray(out: *Buffer, n: u32) !void {
     try out.appendU8(@intFromEnum(DataType.array));
     try out.appendU32(n);
+}
+
+fn emitFloat(out: *Buffer, value: f64) !void {
+    try out.appendU8(@intFromEnum(DataType.float));
+    try out.appendF64(value);
 }
 
 fn emitErr(out: *Buffer, code: u32, msg: []const u8) !void {

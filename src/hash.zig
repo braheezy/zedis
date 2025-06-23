@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const LookupFn = *const fn (*Node, *Node) bool;
+pub const ForEachFn = *const fn (*Node, ?*anyopaque) bool;
 const max_load_factor = 8;
 const rehashing_work = 128;
 
@@ -21,6 +22,10 @@ pub const Table = struct {
         // must be a power of two
         assert(size > 0 and (size - 1) & size == 0);
         self.slots = try std.heap.page_allocator.alloc(?*Node, size);
+        // Initialize all slots to null
+        for (self.slots.?) |*slot| {
+            slot.* = null;
+        }
         self.mask = size - 1;
         self.size = 0;
     }
@@ -60,6 +65,7 @@ pub const Table = struct {
         }
         return null;
     }
+
     fn detach(self: *Table, from: *?*Node) *Node {
         // the target node
         const node = from.*.?;
@@ -68,12 +74,41 @@ pub const Table = struct {
         self.size -= 1;
         return node;
     }
+
+    // Helper function to iterate over a single table
+    fn forEach(self: *Table, cb: ForEachFn, arg: ?*anyopaque) bool {
+        if (self.slots) |slots| {
+            var i: usize = 0;
+            while (i <= self.mask) : (i += 1) {
+                var node = slots[i];
+                while (node) |current| {
+                    if (!cb(current, arg)) return false;
+                    node = current.next;
+                }
+            }
+        }
+        return true;
+    }
 };
 
 pub const Map = struct {
     newer: Table = .{},
     older: Table = .{},
     migrate_pos: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator) !*Map {
+        const map = try allocator.create(Map);
+        map.newer = .{};
+        map.older = .{};
+        try map.newer.init(4);
+        return map;
+    }
+
+    pub fn deinit(self: *Map, allocator: std.mem.Allocator) void {
+        self.newer.deinit();
+        self.older.deinit();
+        allocator.destroy(self);
+    }
 
     pub fn lookup(self: *Map, key: *Node, eq: LookupFn) ?*Node {
         // migrate some keys
@@ -114,6 +149,19 @@ pub const Map = struct {
         }
         // migrate some keys
         self.helpRehashing();
+    }
+
+    /// Iterates over all nodes in both tables, calling the callback function for each node.
+    /// The callback function should return true to continue iteration, or false to stop.
+    /// Returns true if iteration completed, false if it was stopped early by the callback.
+    pub fn forEach(self: *Map, cb: ForEachFn, arg: ?*anyopaque) bool {
+        // First try the newer table
+        if (!self.newer.forEach(cb, arg)) return false;
+        // Then the older table if it exists
+        if (self.older.slots != null) {
+            return self.older.forEach(cb, arg);
+        }
+        return true;
     }
 
     fn triggerRehashing(self: *Map) !void {

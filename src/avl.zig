@@ -11,6 +11,99 @@ pub const Node = struct {
         self.count = 1 + count(self.left) + count(self.right);
     }
 
+    // detach a node and returns the new root of the tree
+    pub fn delete(self: *Node) ?*Node {
+        // the easy case of 0 or 1 child
+        if (self.left == null or self.right == null) return self.deleteEasy();
+        // find the successor
+        var victim = self.right.?;
+        while (victim.left) |left| {
+            victim = left;
+        }
+        // detach the successor
+        const new_root = victim.deleteEasy();
+        // swap with the successor
+        victim.* = self.*;
+        if (victim.left) |left| {
+            left.parent = victim;
+        }
+        if (victim.right) |right| {
+            right.parent = victim;
+        }
+        // attach the successor to the parent
+        if (self.parent) |p| {
+            if (p.left == self) {
+                p.left = victim;
+            } else {
+                p.right = victim;
+            }
+            victim.parent = p;
+            return new_root;
+        }
+        // root node
+        victim.parent = null;
+        return victim;
+    }
+
+    // correct imbalanced nodes and maintain invariants until the root is reached
+    pub fn fix(self: *Node) ?*Node {
+        var current = self;
+        while (true) {
+            // save the fixed subtree
+            var from: **Node = &current;
+            const parent = current.parent;
+            if (parent) |p| {
+                // attach the fixed subtree to the parent
+                from = if (p.left == current) &p.left.? else &p.right.?;
+            }
+            // auxiliary data
+            current.update();
+            // now fix the height difference of 2
+            const l = height(current.left);
+            const r = height(current.right);
+            if (l == r + 2) {
+                from.* = current.fixLeft();
+            } else if (l + 2 == r) {
+                from.* = current.fixRight();
+            }
+            // root node, stop
+            if (parent == null) return from.*;
+            // continue to the parent node because its height may be changed
+            current = parent.?;
+        }
+    }
+
+    // offset into the succeeding or preceding node.
+    // note: the worst-case is O(log N) regardless of how long the offset is.
+    pub fn offset(self: *Node, off: i64) ?*Node {
+        // the rank difference from the starting node
+        var pos: i64 = 0;
+        while (pos != off) {
+            if (pos < off and pos + count(self.right) >= off) {
+                // the target is inside the right subtree
+                self = self.right.?;
+                pos += count(self.left) + 1;
+            } else if (pos > off and pos - count(self.left) <= off) {
+                // the target is inside the left subtree
+                self = self.left.?;
+                pos -= count(self.right) + 1;
+            } else {
+                // go to the parent
+                const parent = self.parent;
+                if (parent) |p| {
+                    if (p.right == self) {
+                        pos -= count(self.left) + 1;
+                    } else {
+                        pos += count(self.right) + 1;
+                    }
+                    self = p;
+                } else {
+                    return null;
+                }
+            }
+        }
+    }
+
     fn rotateLeft(self: *Node) *Node {
         const parent = self.parent;
         const new_node = self.right;
@@ -63,34 +156,6 @@ pub const Node = struct {
         return self.rotateLeft();
     }
 
-    // correct imbalanced nodes and maintain invariants until the root is reached
-    pub fn fix(self: *Node) ?*Node {
-        var current = self;
-        while (true) {
-            // save the fixed subtree
-            var from: **Node = &current;
-            const parent = current.parent;
-            if (parent) |p| {
-                // attach the fixed subtree to the parent
-                from = if (p.left == current) &p.left.? else &p.right.?;
-            }
-            // auxiliary data
-            current.update();
-            // now fix the height difference of 2
-            const l = height(current.left);
-            const r = height(current.right);
-            if (l == r + 2) {
-                from.* = current.fixLeft();
-            } else if (l + 2 == r) {
-                from.* = current.fixRight();
-            }
-            // root node, stop
-            if (parent == null) return from.*;
-            // continue to the parent node because its height may be changed
-            current = parent.?;
-        }
-    }
-
     fn deleteEasy(self: *Node) ?*Node {
         const child = if (self.left) |node| node else self.right;
         const parent = self.parent;
@@ -113,40 +178,6 @@ pub const Node = struct {
             return fixed;
         }
         return child;
-    }
-
-    // detach a node and returns the new root of the tree
-    pub fn delete(self: *Node) ?*Node {
-        // the easy case of 0 or 1 child
-        if (self.left == null or self.right == null) return self.deleteEasy();
-        // find the successor
-        var victim = self.right.?;
-        while (victim.left) |left| {
-            victim = left;
-        }
-        // detach the successor
-        const new_root = victim.deleteEasy();
-        // swap with the successor
-        victim.* = self.*;
-        if (victim.left) |left| {
-            left.parent = victim;
-        }
-        if (victim.right) |right| {
-            right.parent = victim;
-        }
-        // attach the successor to the parent
-        if (self.parent) |p| {
-            if (p.left == self) {
-                p.left = victim;
-            } else {
-                p.right = victim;
-            }
-            victim.parent = p;
-            return new_root;
-        }
-        // root node
-        victim.parent = null;
-        return victim;
     }
 };
 

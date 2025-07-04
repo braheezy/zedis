@@ -78,30 +78,32 @@ pub const Node = struct {
     pub fn offset(self: *Node, off: i64) ?*Node {
         // the rank difference from the starting node
         var pos: i64 = 0;
+        var current = self;
         while (pos != off) {
-            if (pos < off and pos + count(self.right) >= off) {
+            if (pos < off and pos + count(current.right) >= off) {
                 // the target is inside the right subtree
-                self = self.right.?;
-                pos += count(self.left) + 1;
-            } else if (pos > off and pos - count(self.left) <= off) {
+                current = current.right.?;
+                pos += count(current.left) + 1;
+            } else if (pos > off and pos - count(current.left) <= off) {
                 // the target is inside the left subtree
-                self = self.left.?;
-                pos -= count(self.right) + 1;
+                current = current.left.?;
+                pos -= count(current.right) + 1;
             } else {
                 // go to the parent
-                const parent = self.parent;
+                const parent = current.parent;
                 if (parent) |p| {
-                    if (p.right == self) {
-                        pos -= count(self.left) + 1;
+                    if (p.right == current) {
+                        pos -= count(current.left) + 1;
                     } else {
-                        pos += count(self.right) + 1;
+                        pos += count(current.right) + 1;
                     }
-                    self = p;
+                    current = p;
                 } else {
                     return null;
                 }
             }
         }
+        return current;
     }
 
     fn rotateLeft(self: *Node) *Node {

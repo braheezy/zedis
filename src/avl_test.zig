@@ -236,3 +236,49 @@ test "edge cases" {
     try testing.expect(try c.delete(1));
     try verifyContainer(&c, &[_]u32{});
 }
+
+test "offset navigation" {
+    // Test trees of different sizes
+    const test_sizes = [_]u32{ 1, 5, 10, 20, 50 }; // Reduced sizes for faster testing
+    for (test_sizes) |size| {
+        var c = Container.init(testing.allocator);
+        defer c.deinit();
+
+        // Insert sequential values
+        var i: u32 = 0;
+        while (i < size) : (i += 1) {
+            try c.add(i);
+        }
+
+        // Find minimum node (leftmost)
+        var min_node = c.root.?;
+        while (min_node.left) |left| {
+            min_node = left;
+        }
+
+        // Test offset navigation from each node
+        i = 0;
+        while (i < size) : (i += 1) {
+            // Get node at position i
+            const node = min_node.offset(@intCast(i)) orelse unreachable;
+            const node_data: *Data = @ptrCast(@alignCast(node));
+            try testing.expectEqual(i, node_data.val);
+
+            // Test navigation to every other node from this node
+            var j: u32 = 0;
+            while (j < size) : (j += 1) {
+                const offset: i64 = @intCast(j);
+                const base_pos: i64 = @intCast(i);
+                const delta = offset - base_pos;
+
+                const target = node.offset(delta) orelse unreachable;
+                const target_data: *Data = @ptrCast(@alignCast(target));
+                try testing.expectEqual(j, target_data.val);
+            }
+
+            // Test out of bounds offsets
+            try testing.expectEqual(@as(?*Node, null), node.offset(-@as(i64, @intCast(i)) - 1));
+            try testing.expectEqual(@as(?*Node, null), node.offset(@as(i64, @intCast(size - i))));
+        }
+    }
+}

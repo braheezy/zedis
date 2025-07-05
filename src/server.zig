@@ -7,6 +7,7 @@ const readAll = root.readAll;
 const writeAll = root.writeAll;
 const max_msg_size = root.max_msg_size;
 const max_args = 200 * 1000;
+const idle_timeout_ms = 5 * 1000;
 const Conn = @import("Conn.zig").Conn;
 const Buffer = @import("Buffer.zig");
 const hash = @import("hash.zig");
@@ -14,6 +15,7 @@ const DataType = root.DataType;
 const ErrorCode = root.ErrorCode;
 const ValueType = root.ValueType;
 const zset = @import("zset.zig");
+const Dlist = @import("Dlist.zig");
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -34,7 +36,12 @@ pub fn main() !void {
         }
     }
 
-    g_data = .{};
+    g_data = .{
+        .conns = std.AutoHashMap(std.posix.socket_t, *Conn).init(allocator),
+        .idle_list = .{},
+    };
+    Dlist.init(&g_data.idle_list);
+    defer g_data.conns.deinit();
 
     const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     defer std.posix.close(fd);
@@ -63,10 +70,6 @@ pub fn main() !void {
 
     try std.posix.listen(fd, std.os.linux.SOMAXCONN);
 
-    // a map of all client connections, keyed by fd
-    var conns = std.ArrayList(?*Conn).init(allocator);
-    defer conns.deinit();
-
     // the event loop
     var poll_args = std.ArrayList(std.posix.pollfd).init(allocator);
     defer poll_args.deinit();
@@ -79,38 +82,30 @@ pub fn main() !void {
         try poll_args.append(.{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 });
 
         // the rest are connection sockets
-        for (conns.items) |maybe_conn| {
-            if (maybe_conn) |conn| {
-                var pfd = std.posix.pollfd{
-                    .fd = conn.fd,
-                    .events = std.os.linux.POLL.ERR,
-                    .revents = 0,
-                };
-                // poll() flags from the application's intent
-                if (conn.want_read) {
-                    pfd.events |= std.os.linux.POLL.IN;
-                }
-                if (conn.want_write) {
-                    pfd.events |= std.os.linux.POLL.OUT;
-                }
-                try poll_args.append(pfd);
-            } else {
-                continue;
+        var values_it = g_data.conns.valueIterator();
+        while (values_it.next()) |conn| {
+            var pfd = std.posix.pollfd{
+                .fd = conn.*.fd,
+                .events = std.os.linux.POLL.ERR,
+                .revents = 0,
+            };
+            // poll() flags from the application's intent
+            if (conn.*.want_read) {
+                pfd.events |= std.os.linux.POLL.IN;
             }
+            if (conn.*.want_write) {
+                pfd.events |= std.os.linux.POLL.OUT;
+            }
+            try poll_args.append(pfd);
         }
 
         // wait for readiness
-        _ = try std.posix.poll(poll_args.items, -1);
+        const timeout_ms = try nextTimerMs();
+        _ = try std.posix.poll(poll_args.items, timeout_ms);
 
         // handle the listening socket
         if (poll_args.items[0].revents != 0) {
-            if (try handleAccept(allocator, fd)) |conn| {
-                const idx: usize = @intCast(conn.fd);
-                while (conns.items.len <= idx) {
-                    try conns.append(null);
-                }
-                conns.items[idx] = conn;
-            }
+            _ = try handleAccept(allocator, fd);
         }
 
         // handle connection sockets
@@ -122,8 +117,14 @@ pub fn main() !void {
             if (ready == 0) continue;
 
             const idx: usize = @intCast(poll_args.items[i].fd);
-            const conn = conns.items[idx] orelse unreachable;
+            const conn = g_data.conns.get(@intCast(idx)) orelse unreachable;
 
+            // update the idle timer by moving conn to the end of the list
+            conn.last_active_ms = try getMonotonicMs();
+            conn.idle_node.detach();
+            g_data.idle_list.insert_before(&conn.idle_node);
+
+            // handle IO
             if (ready & std.os.linux.POLL.IN != 0) {
                 // application logic
                 assert(conn.want_read);
@@ -137,12 +138,12 @@ pub fn main() !void {
 
             // close the socket from socket error or application logic
             if (ready & std.os.linux.POLL.ERR != 0 or conn.want_close) {
-                std.posix.close(conn.fd);
-                const j: usize = @intCast(conn.fd);
-                conns.items[j] = null;
-                conn.deinit(allocator);
+                connDestroy(conn, allocator);
             }
         }
+
+        // handle timers
+        try processTimers(allocator);
     }
 }
 
@@ -159,9 +160,20 @@ const Response = struct {
 
 const GlobalData = struct {
     db: hash.Map = .{},
+    // a map of all client connections, keyed by fd
+    conns: std.AutoHashMap(std.posix.socket_t, *Conn) = undefined,
+    // timers for idle connections
+    idle_list: Dlist = undefined,
 };
 
 var g_data: GlobalData = undefined;
+
+fn connDestroy(conn: *Conn, allocator: std.mem.Allocator) void {
+    std.posix.close(conn.fd);
+    _ = g_data.conns.remove(conn.fd);
+    Dlist.detach(&conn.idle_node);
+    conn.deinit(allocator);
+}
 
 const Entry = struct {
     node: hash.Node = .{},
@@ -225,7 +237,7 @@ fn fcntlSetNonBlocking(fd: std.posix.socket_t) !void {
     );
 }
 
-fn handleAccept(allocator: std.mem.Allocator, fd: std.posix.socket_t) !?*Conn {
+fn handleAccept(allocator: std.mem.Allocator, fd: std.posix.socket_t) !i32 {
     // accept
     var client_addr: std.posix.sockaddr = undefined;
     var client_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
@@ -234,7 +246,7 @@ fn handleAccept(allocator: std.mem.Allocator, fd: std.posix.socket_t) !?*Conn {
         @as(*std.posix.sockaddr, @ptrCast(&client_addr)),
         &client_addr_len,
         0,
-    ) catch return null;
+    ) catch return -1;
 
     const ip = client_addr.data;
     std.log.info("new client from {d}.{d}.{d}.{d}", .{
@@ -245,12 +257,16 @@ fn handleAccept(allocator: std.mem.Allocator, fd: std.posix.socket_t) !?*Conn {
     });
 
     // set the new connection fd to nonblocking mode
-    fcntlSetNonBlocking(client_fd) catch return null;
+    fcntlSetNonBlocking(client_fd) catch return -1;
 
     var conn = try Conn.init(allocator, client_fd);
     conn.want_read = true;
+    conn.last_active_ms = try getMonotonicMs();
+    g_data.idle_list.insert_before(&conn.idle_node);
 
-    return conn;
+    // put it into the map
+    try g_data.conns.put(conn.fd, conn);
+    return 0;
 }
 
 fn handleRead(allocator: std.mem.Allocator, conn: *Conn) !void {
@@ -542,6 +558,39 @@ fn emitErr(out: *Buffer, code: u32, msg: []const u8) !void {
     try out.appendU32(code);
     try out.appendU32(@intCast(msg.len));
     try out.append(msg);
+}
+
+fn getMonotonicMs() !u64 {
+    const timespec_tv = try std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC);
+    return @as(u64, @intCast(timespec_tv.sec)) * 1000 + @as(u64, @intCast(timespec_tv.nsec)) / 1000 / 1000;
+}
+
+fn nextTimerMs() !i32 {
+    if (g_data.idle_list.empty()) {
+        return -1; // no timers, no timeouts
+    }
+
+    const now_ms = try getMonotonicMs();
+    const conn: *Conn = @fieldParentPtr("idle_node", g_data.idle_list.next.?);
+    const next_ms = conn.last_active_ms + idle_timeout_ms;
+    if (next_ms <= now_ms) {
+        return 0; // missed?
+    }
+    return @intCast(next_ms - now_ms);
+}
+
+fn processTimers(allocator: std.mem.Allocator) !void {
+    const now_ms = try getMonotonicMs();
+    while (!g_data.idle_list.empty()) {
+        const conn: *Conn = @fieldParentPtr("idle_node", g_data.idle_list.next.?);
+        const next_ms = conn.last_active_ms + idle_timeout_ms;
+        if (next_ms >= now_ms) {
+            break; // not expired
+        }
+
+        std.log.info("removing idle connection: {d}", .{conn.fd});
+        connDestroy(conn, allocator);
+    }
 }
 
 // -----------------------------------------------------------------------------

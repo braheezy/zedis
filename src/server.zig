@@ -16,6 +16,7 @@ const ErrorCode = root.ErrorCode;
 const ValueType = root.ValueType;
 const zset = @import("zset.zig");
 const Dlist = @import("Dlist.zig");
+const heap = @import("heap.zig");
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -164,6 +165,8 @@ const GlobalData = struct {
     conns: std.AutoHashMap(std.posix.socket_t, *Conn) = undefined,
     // timers for idle connections
     idle_list: Dlist = undefined,
+    // timers for TTLs
+    heap: std.ArrayList(heap.Item) = undefined,
 };
 
 var g_data: GlobalData = undefined;
@@ -178,6 +181,8 @@ fn connDestroy(conn: *Conn, allocator: std.mem.Allocator) void {
 const Entry = struct {
     node: hash.Node = .{},
     key: []const u8 = undefined,
+    // for TTL, array index to the heap item
+    head_index: usize = std.math.maxInt(usize),
     value: ValueType = .init,
     // one of the following
     str: []const u8 = undefined,
@@ -190,13 +195,28 @@ const Entry = struct {
         };
         return entry;
     }
+
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         switch (self.value) {
             .init => {},
             .string => allocator.free(self.str),
             .zset => self.set.clear(allocator),
         }
+        self.setTtl(null) catch unreachable;
         allocator.destroy(self);
+    }
+
+    fn setTtl(self: *Entry, ttl_ms: ?u64) !void {
+        if (ttl_ms == null and self.head_index != std.math.maxInt(usize)) {
+            // setting a negative TTL means removing the TTL
+            heapDelete(&g_data.heap, self.head_index);
+            self.head_index = std.math.maxInt(usize);
+        } else if (ttl_ms != null) {
+            // add or update the heap data structure
+            const expire_at = try getMonotonicMs() + ttl_ms.?;
+            const item = heap.Item{ .val = expire_at, .ref = if (self.head_index == std.math.maxInt(usize)) null else &self.head_index };
+            try heapUpsert(&g_data.heap, if (self.head_index == std.math.maxInt(usize)) g_data.heap.items.len else self.head_index, item);
+        }
     }
 };
 
@@ -436,6 +456,10 @@ fn doRequest(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer
         return zscore(cmd, out);
     } else if (cmd.len == 6 and std.mem.eql(u8, cmd[0], "zquery")) {
         return zquery(cmd, out);
+    } else if (cmd.len == 3 and std.mem.eql(u8, cmd[0], "pexpire")) {
+        return expire(cmd, out);
+    } else if (cmd.len == 2 and std.mem.eql(u8, cmd[0], "pttl")) {
+        return ttl(cmd, out);
     } else {
         // unknown command
         return try emitErr(
@@ -511,6 +535,45 @@ fn del(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !voi
     return emitInt(out, 0);
 }
 
+// PEXPIRE key ttl_ms
+fn expire(cmd: []const []const u8, out: *Buffer) !void {
+    const parsed_ttl = try std.fmt.parseInt(i64, cmd[2], 10);
+    const ttl_ms = if (parsed_ttl < 0) null else @as(u64, @intCast(parsed_ttl));
+
+    var dummy_entry = LookupKey{};
+    dummy_entry.key = cmd[1];
+    dummy_entry.node.code = root.stringHash(cmd[1]);
+
+    const node = g_data.db.lookup(&dummy_entry.node, entryEq);
+    if (node) |n| {
+        const entry: *Entry = @fieldParentPtr("node", n);
+        try entry.setTtl(ttl_ms);
+    }
+    return emitInt(out, if (node == null) 0 else 1);
+}
+
+// PTTL key
+fn ttl(cmd: []const []const u8, out: *Buffer) !void {
+    var dummy_entry = LookupKey{};
+    dummy_entry.key = cmd[1];
+    dummy_entry.node.code = root.stringHash(cmd[1]);
+
+    const node = g_data.db.lookup(&dummy_entry.node, entryEq);
+    if (node == null) {
+        return emitInt(out, -2); // not found
+    }
+    const n = node.?;
+
+    const entry: *Entry = @fieldParentPtr("node", n);
+    if (entry.head_index == std.math.maxInt(usize)) {
+        return emitInt(out, -1); // no TTL
+    }
+
+    const expire_at = g_data.heap.items[entry.head_index].val;
+    const now_ms = try getMonotonicMs();
+    return emitInt(out, if (expire_at > now_ms) @intCast(expire_at - now_ms) else 0);
+}
+
 fn emitNil(out: *Buffer) !void {
     try out.appendU8(@intFromEnum(DataType.nil));
 }
@@ -566,21 +629,32 @@ fn getMonotonicMs() !u64 {
 }
 
 fn nextTimerMs() !i32 {
-    if (g_data.idle_list.empty()) {
-        return -1; // no timers, no timeouts
+    const now_ms = try getMonotonicMs();
+    var next_ms: ?u64 = null;
+
+    // idle timers using a linked list
+    if (!g_data.idle_list.empty()) {
+        const conn: *Conn = @fieldParentPtr("idle_node", g_data.idle_list.next.?);
+        next_ms = conn.last_active_ms + idle_timeout_ms;
     }
 
-    const now_ms = try getMonotonicMs();
-    const conn: *Conn = @fieldParentPtr("idle_node", g_data.idle_list.next.?);
-    const next_ms = conn.last_active_ms + idle_timeout_ms;
-    if (next_ms <= now_ms) {
+    // TTL timers using a heap
+    if (g_data.heap.items.len != 0 and (next_ms != null and g_data.heap.items[0].val < next_ms.?)) {
+        next_ms = g_data.heap.items[0].val;
+    }
+    // timeout value
+    if (next_ms == null) {
+        return -1; // no timers, no timeouts
+    }
+    if (next_ms.? <= now_ms) {
         return 0; // missed?
     }
-    return @intCast(next_ms - now_ms);
+    return @intCast(next_ms.? - now_ms);
 }
 
 fn processTimers(allocator: std.mem.Allocator) !void {
     const now_ms = try getMonotonicMs();
+    // idle timers using a linked list
     while (!g_data.idle_list.empty()) {
         const conn: *Conn = @fieldParentPtr("idle_node", g_data.idle_list.next.?);
         const next_ms = conn.last_active_ms + idle_timeout_ms;
@@ -591,6 +665,55 @@ fn processTimers(allocator: std.mem.Allocator) !void {
         std.log.info("removing idle connection: {d}", .{conn.fd});
         connDestroy(conn, allocator);
     }
+    // TTL timers using a heap
+    const max_works = 2000;
+    var nworks: usize = 0;
+    const heap_copy = g_data.heap;
+    while (heap_copy.items.len != 0 and heap_copy.items[0].val < now_ms) {
+        if (heap_copy.items[0].ref) |ref| {
+            const entry: *Entry = @fieldParentPtr("head_index", ref);
+            const node = g_data.db.delete(&entry.node, nodeSame);
+            assert(node == &entry.node);
+            // delete the key
+            entry.deinit(allocator);
+        }
+        if (nworks >= max_works) {
+            // don't stall the server if too many keys are expiring at once
+            break;
+        }
+        nworks += 1;
+    }
+}
+
+fn heapDelete(h: *std.ArrayList(heap.Item), pos: usize) void {
+    // swap the erased item with the last item
+    if (pos >= h.items.len) return;
+
+    // Move the last item to the position being deleted
+    h.items[pos] = h.items[h.items.len - 1];
+    _ = h.pop();
+
+    // Update the heap if there are still items and we're not at the end
+    if (pos < h.items.len) {
+        heap.update(h.items, pos);
+    }
+}
+
+fn heapUpsert(h: *std.ArrayList(heap.Item), pos: usize, item: heap.Item) !void {
+    var p = pos;
+    if (p < h.items.len) {
+        // Update existing item
+        h.items[p] = item;
+    } else {
+        // Add new item at the end
+        try h.append(item);
+        p = h.items.len - 1;
+    }
+    heap.update(h.items, p);
+}
+
+fn nodeSame(node: *hash.Node, key: *hash.Node) bool {
+    return node == key;
 }
 
 // -----------------------------------------------------------------------------

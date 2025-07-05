@@ -17,6 +17,7 @@ const ValueType = root.ValueType;
 const zset = @import("zset.zig");
 const Dlist = @import("Dlist.zig");
 const heap = @import("heap.zig");
+const ThreadPool = @import("threadPool.zig").ThreadPool;
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -40,6 +41,7 @@ pub fn main() !void {
     g_data = .{
         .conns = std.AutoHashMap(std.posix.socket_t, *Conn).init(allocator),
         .idle_list = .{},
+        .thread_pool = try ThreadPool.init(allocator, 4),
     };
     Dlist.init(&g_data.idle_list);
     defer g_data.conns.deinit();
@@ -167,6 +169,8 @@ const GlobalData = struct {
     idle_list: Dlist = undefined,
     // timers for TTLs
     heap: std.ArrayList(heap.Item) = undefined,
+    // the thread pool
+    thread_pool: ThreadPool = undefined,
 };
 
 var g_data: GlobalData = undefined;
@@ -197,12 +201,36 @@ const Entry = struct {
     }
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
+        // unlink it from any data structures
+        // remove from the heap data structure
+        self.setTtl(null) catch unreachable;
+        // run the destructor in a thread pool for large data structures
+        const set_size = if (self.value == .zset) self.set.map.size() else 0;
+        const large_container_size = 1000;
+        if (set_size > large_container_size) {
+            // Try to allocate context for async deletion, fall back to sync if allocation fails
+            if (allocator.create(EntryDelContext)) |ctx| {
+                ctx.* = .{ .entry = self, .allocator = allocator };
+                g_data.thread_pool.queueWork(entryDelFunc, @as(*anyopaque, @ptrCast(ctx)));
+            } else |_| {
+                self.deintSync(allocator); // fallback to sync on allocation failure
+            }
+        } else {
+            self.deintSync(allocator); // small; avoid context switches
+        }
+
         switch (self.value) {
             .init => {},
             .string => allocator.free(self.str),
             .zset => self.set.clear(allocator),
         }
-        self.setTtl(null) catch unreachable;
+        allocator.destroy(self);
+    }
+
+    fn deintSync(self: *Entry, allocator: std.mem.Allocator) void {
+        if (self.value == .zset) {
+            self.set.clear(allocator);
+        }
         allocator.destroy(self);
     }
 
@@ -219,6 +247,18 @@ const Entry = struct {
         }
     }
 };
+
+const EntryDelContext = struct {
+    entry: *Entry,
+    allocator: std.mem.Allocator,
+};
+
+fn entryDelFunc(arg: *anyopaque) void {
+    const ctx = @as(*const EntryDelContext, @ptrCast(@alignCast(arg)));
+    ctx.entry.deintSync(ctx.allocator);
+    // Free the context
+    ctx.allocator.destroy(ctx);
+}
 
 const LookupKey = struct {
     node: hash.Node = .{},

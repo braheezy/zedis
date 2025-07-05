@@ -57,7 +57,7 @@ pub const Table = struct {
 
             // match hash + key
             if (cur.code == key.code and eq(cur, key)) {
-                return from; // pointer‐to‐slot, for deletion
+                return from; // may be a node, may be a slot
             }
 
             // advance to next pointer‐slot
@@ -162,6 +162,10 @@ pub const Map = struct {
             return self.older.forEach(cb, arg);
         }
         return true;
+    }
+
+    pub fn size(self: *Map) usize {
+        return self.newer.size + self.older.size;
     }
 
     fn triggerRehashing(self: *Map) !void {

@@ -12,6 +12,8 @@ const Buffer = @import("Buffer.zig");
 const hash = @import("hash.zig");
 const DataType = root.DataType;
 const ErrorCode = root.ErrorCode;
+const ValueType = root.ValueType;
+const zset = @import("zset.zig");
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
@@ -164,12 +166,37 @@ var g_data: GlobalData = undefined;
 const Entry = struct {
     node: hash.Node = .{},
     key: []const u8 = undefined,
-    value: []const u8 = undefined,
+    value: ValueType = .init,
+    // one of the following
+    str: []const u8 = undefined,
+    set: zset.Set = undefined,
+
+    fn init(allocator: std.mem.Allocator, value_type: ValueType) !*Entry {
+        const entry = try allocator.create(Entry);
+        entry.* = .{
+            .value = value_type,
+        };
+        return entry;
+    }
+    fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
+        switch (self.value) {
+            .init => {},
+            .string => allocator.free(self.str),
+            .zset => self.set.clear(allocator),
+        }
+        allocator.destroy(self);
+    }
 };
 
-fn entryEq(a: *hash.Node, b: *hash.Node) bool {
-    const left: *Entry = @fieldParentPtr("node", a);
-    const right: *Entry = @fieldParentPtr("node", b);
+const LookupKey = struct {
+    node: hash.Node = .{},
+    key: []const u8 = undefined,
+};
+
+// equality comparison for the top-level hashstable
+fn entryEq(node: *hash.Node, key: *hash.Node) bool {
+    const left: *Entry = @fieldParentPtr("node", node);
+    const right: *LookupKey = @fieldParentPtr("node", key);
     return std.mem.eql(u8, left.key, right.key);
 }
 
@@ -186,14 +213,6 @@ fn keys(out: *Buffer) !void {
 
     // Iterate over all entries
     _ = g_data.db.forEach(keysCb, out);
-}
-
-fn stringHash(data: []const u8) u64 {
-    var h: u64 = 0x811C9DC5;
-    for (data) |c| {
-        h = (h + c) *% 0x01000193;
-    }
-    return h;
 }
 
 fn fcntlSetNonBlocking(fd: std.posix.socket_t) !void {
@@ -393,6 +412,14 @@ fn doRequest(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer
         return del(allocator, cmd, out);
     } else if (cmd.len == 1 and std.mem.eql(u8, cmd[0], "keys")) {
         return keys(out);
+    } else if (cmd.len == 4 and std.mem.eql(u8, cmd[0], "zadd")) {
+        return zadd(allocator, cmd, out);
+    } else if (cmd.len == 3 and std.mem.eql(u8, cmd[0], "zrem")) {
+        return zrem(allocator, cmd, out);
+    } else if (cmd.len == 3 and std.mem.eql(u8, cmd[0], "zscore")) {
+        return zscore(cmd, out);
+    } else if (cmd.len == 6 and std.mem.eql(u8, cmd[0], "zquery")) {
+        return zquery(cmd, out);
     } else {
         // unknown command
         return try emitErr(
@@ -411,59 +438,58 @@ fn makeResponse(response: Response, outgoing: *Buffer) !void {
 }
 
 fn get(cmd: []const []const u8, out: *Buffer) !void {
-    // a dummy `Entry` just for the lookup
-    var dummy_entry = Entry{};
+    // a dummy struct just for the lookup
+    var dummy_entry = LookupKey{};
     dummy_entry.key = cmd[1];
-    dummy_entry.node.code = stringHash(cmd[1]);
+    dummy_entry.node.code = root.stringHash(cmd[1]);
 
     if (g_data.db.lookup(&dummy_entry.node, entryEq)) |node| {
+        // copy the value
         const entry: *Entry = @fieldParentPtr("node", node);
-        const value = entry.value;
-        assert(value.len < max_msg_size);
-        return emitString(out, value);
+        if (entry.value != .string) {
+            return try emitErr(out, @intFromEnum(ErrorCode.bad_typ), "not a string value");
+        }
+        return emitString(out, entry.str);
     } else {
         return emitNil(out);
     }
 }
 
 fn set(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !void {
-    // a dummy `Entry` just for the lookup
-    var dummy_entry = Entry{};
+    // a dummy struct just for the lookup
+    var dummy_entry = LookupKey{};
     dummy_entry.key = cmd[1];
-    dummy_entry.node.code = stringHash(cmd[1]);
+    dummy_entry.node.code = root.stringHash(cmd[1]);
 
     if (g_data.db.lookup(&dummy_entry.node, entryEq)) |node| {
         // found, update the value
         const entry: *Entry = @fieldParentPtr("node", node);
+        if (entry.value != .string) {
+            return try emitErr(out, @intFromEnum(ErrorCode.bad_typ), "a non-string value exists");
+        }
         // Free old value and duplicate new one
-        allocator.free(entry.value);
-        entry.value = try allocator.dupe(u8, cmd[2]);
+        allocator.free(entry.str);
+        entry.str = try allocator.dupe(u8, cmd[2]);
     } else {
         // not found, allocate & insert a new pair
-        const entry = try allocator.create(Entry);
-        entry.* = .{
-            .key = try allocator.dupe(u8, cmd[1]),
-            .node = .{
-                .code = dummy_entry.node.code,
-            },
-            .value = try allocator.dupe(u8, cmd[2]),
-        };
+        const entry = try Entry.init(allocator, .string);
+        entry.key = try allocator.dupe(u8, cmd[1]);
+        entry.node.code = dummy_entry.node.code;
+        entry.str = try allocator.dupe(u8, cmd[2]);
         try g_data.db.insert(&entry.node);
     }
     return emitNil(out);
 }
 
 fn del(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !void {
-    // a dummy `Entry` just for the lookup
-    var dummy_entry = Entry{};
+    // a dummy struct just for the lookup
+    var dummy_entry = LookupKey{};
     dummy_entry.key = cmd[1];
-    dummy_entry.node.code = stringHash(cmd[1]);
+    dummy_entry.node.code = root.stringHash(cmd[1]);
     if (g_data.db.delete(&dummy_entry.node, entryEq)) |node| {
         const entry: *Entry = @fieldParentPtr("node", node);
-        // free the strings and entry
-        allocator.free(entry.key);
-        allocator.free(entry.value);
-        allocator.destroy(entry);
+        // deallocate entry resources
+        entry.deinit(allocator);
         return emitInt(out, 1);
     }
     return emitInt(out, 0);
@@ -489,6 +515,23 @@ fn emitArray(out: *Buffer, n: u32) !void {
     try out.appendU32(n);
 }
 
+fn emitBeginArray(out: *Buffer) !usize {
+    try out.appendU8(@intFromEnum(DataType.array));
+    try out.appendU32(0);
+    return out.len() - 4;
+}
+
+fn emitEndArray(out: *Buffer, pos: usize, n: u32) !void {
+    // Ensure the byte right before the length placeholder is the array tag
+    assert(pos > 0);
+    const slice = out.slice();
+    assert(slice[pos - 1] == @intFromEnum(DataType.array));
+
+    // Overwrite the 4-byte placeholder with the actual element count (little-endian)
+    const len_bytes = std.mem.toBytes(n);
+    @memcpy(slice[pos .. pos + 4], &len_bytes);
+}
+
 fn emitFloat(out: *Buffer, value: f64) !void {
     try out.appendU8(@intFromEnum(DataType.float));
     try out.appendF64(value);
@@ -499,4 +542,129 @@ fn emitErr(out: *Buffer, code: u32, msg: []const u8) !void {
     try out.appendU32(code);
     try out.appendU32(@intCast(msg.len));
     try out.append(msg);
+}
+
+// -----------------------------------------------------------------------------
+// ZSet utilities and commands
+// -----------------------------------------------------------------------------
+
+var k_empty_zset = zset.Set{
+    .root = null,
+    .map = .{},
+};
+
+fn expectZSet(key: []const u8) ?*zset.Set {
+    var dummy = LookupKey{};
+    dummy.key = key;
+    dummy.node.code = root.stringHash(key);
+    if (g_data.db.lookup(&dummy.node, entryEq)) |node| {
+        const entry: *Entry = @fieldParentPtr("node", node);
+        return if (entry.value == .zset) &entry.set else null;
+    }
+    // non-existent key behaves like an empty zset
+    return @constCast(&k_empty_zset);
+}
+
+// zadd zset score name
+fn zadd(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !void {
+    const score = std.fmt.parseFloat(f64, cmd[2]) catch {
+        return try emitErr(out, @intFromEnum(ErrorCode.bad_arg), "expect float");
+    };
+
+    // look up or create the zset
+    var dummy_entry = LookupKey{};
+    dummy_entry.key = cmd[1];
+    dummy_entry.node.code = root.stringHash(cmd[1]);
+
+    const ent = if (g_data.db.lookup(&dummy_entry.node, entryEq)) |node| blk: {
+        // check the existing key
+        const entry: *Entry = @fieldParentPtr("node", node);
+        if (entry.value != .zset) {
+            return try emitErr(out, @intFromEnum(ErrorCode.bad_typ), "expect zset");
+        }
+        break :blk entry;
+    } else blk: {
+        // insert a new key
+        const entry = try Entry.init(allocator, .zset);
+        entry.key = try allocator.dupe(u8, cmd[1]);
+        entry.node.code = dummy_entry.node.code;
+        entry.set = .{
+            .root = null,
+            .map = .{},
+        };
+        try g_data.db.insert(&entry.node);
+        break :blk entry;
+    };
+
+    // add or update the tuple
+    const added = try ent.set.insert(allocator, cmd[3], score);
+    return emitInt(out, @intFromBool(added));
+}
+
+// zrem zset name
+fn zrem(allocator: std.mem.Allocator, cmd: []const []const u8, out: *Buffer) !void {
+    const set_ptr = expectZSet(cmd[1]) orelse {
+        return try emitErr(out, @intFromEnum(ErrorCode.bad_typ), "expect zset");
+    };
+
+    const name = cmd[2];
+    const node = set_ptr.lookup(name);
+    if (node) |znode| {
+        set_ptr.delete(allocator, znode);
+    }
+    return emitInt(out, if (node == null) 0 else 1);
+}
+
+// zscore zset name
+fn zscore(cmd: []const []const u8, out: *Buffer) !void {
+    const set_ptr = expectZSet(cmd[1]) orelse {
+        return try emitErr(out, @intFromEnum(ErrorCode.bad_typ), "expect zset");
+    };
+
+    const name = cmd[2];
+    if (set_ptr.lookup(name)) |znode| {
+        return emitFloat(out, znode.score);
+    }
+    return emitNil(out);
+}
+
+// zquery zset score name offset limit
+fn zquery(cmd: []const []const u8, out: *Buffer) !void {
+    // parse args
+    const score = std.fmt.parseFloat(f64, cmd[2]) catch {
+        return try emitErr(out, @intFromEnum(ErrorCode.bad_arg), "expect fp number");
+    };
+    const name = cmd[3];
+    const offset = std.fmt.parseInt(i64, cmd[4], 10) catch {
+        return try emitErr(out, @intFromEnum(ErrorCode.bad_arg), "expect int");
+    };
+    const limit = std.fmt.parseInt(i64, cmd[5], 10) catch {
+        return try emitErr(out, @intFromEnum(ErrorCode.bad_arg), "expect int");
+    };
+
+    // get the zset
+    const set_ptr = expectZSet(cmd[1]) orelse {
+        return try emitErr(out, @intFromEnum(ErrorCode.bad_typ), "expect zset");
+    };
+
+    // seek to the key
+    if (limit <= 0) {
+        return emitArray(out, 0);
+    }
+
+    const limit_u: u32 = @intCast(limit);
+    var node_opt = set_ptr.seekGe(score, name);
+    node_opt = zset.offset(node_opt, @intCast(offset));
+
+    const pos = try emitBeginArray(out);
+    var n: u32 = 0;
+    var current = node_opt;
+    while (current) |znode| {
+        if (n >= limit_u) break;
+        try emitString(out, znode.name[0..znode.len]);
+        try emitFloat(out, znode.score);
+        current = zset.offset(current, 1);
+        n += 2;
+    }
+    try emitEndArray(out, pos, n);
 }

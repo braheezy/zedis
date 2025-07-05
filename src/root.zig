@@ -27,7 +27,23 @@ pub const DataType = enum {
     array,
 };
 
+pub const ValueType = enum {
+    init,
+    string,
+    zset,
+};
+
 pub const ErrorCode = enum {
     unknown,
     too_big,
+    bad_typ,
+    bad_arg,
 };
+
+pub fn stringHash(data: []const u8) u64 {
+    var h: u64 = 0x811C9DC5;
+    for (data) |c| {
+        h = (h + @as(u64, c)) *% 0x01000193;
+    }
+    return h;
+}
